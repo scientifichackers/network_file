@@ -2,81 +2,52 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
 import 'package:http_server/http_server.dart';
+import 'package:logging/logging.dart';
 import 'package:path/path.dart' as pathlib;
 
-const BCAST_ADDR = "255.255.255.255";
-const UDP_PORT = 10003;
+const BCAST_ADDR = "255.255.255.255", UDP_PORT = 10003, _NAME = "network_file";
+final _l = Logger(_NAME);
 
 class FileIndex {
-  Map<String, File> fileMap = {};
-  Directory root;
-  bool useMD5Key, recursive;
-  VirtualDirectory vdir;
+  final Directory root;
+  final VirtualDirectory vDir;
 
-  FileIndex(this.root, {this.useMD5Key: false, this.recursive: false}) {
-    root = root.absolute;
-    vdir = VirtualDirectory(root.path);
-  }
+  FileIndex(Directory root)
+      : this.root = root.absolute,
+        vDir = VirtualDirectory(root.path);
 
-  Future<void> build() async {
-    await for (FileSystemEntity file in root.list(recursive: recursive)) {
-      if (file is File) {
-        await add(file);
-      }
-    }
-  }
-
-  Future<void> add(File file) async {
-    var key = pathlib.relative(file.path, from: root.path);
-    if (useMD5Key) {
-      key = md5.convert(await file.readAsBytes()).toString();
-    }
-    fileMap[key] = file;
+  File getFile(String key) {
+    return File(root.path + "/" + key);
   }
 
   void serveFile(String key, HttpRequest request) {
-    File file;
-    if (useMD5Key) {
-      if (!fileMap.containsKey(key)) {
-        request.response
-          ..statusCode = HttpStatus.notFound
-          ..close();
-        return;
-      }
-      file = fileMap[key];
-    } else {
-      print(root.path);
-      print(key);
-      print(root.path + "/" + key);
-      file = File(root.path + "/" + key);
-    }
-    vdir.serveFile(file, request);
+    vDir.serveFile(getFile(key), request);
   }
 }
 
 class FileDiscoveryServer {
   RawDatagramSocket sock;
-  FileIndex index;
-  List<int> responsePrefix;
+  final FileIndex index;
+  final List<int> responsePrefix;
 
-  FileDiscoveryServer(this.index, int transferServerPort, {this.sock}) {
-    responsePrefix = utf8.encode(transferServerPort.toString());
-  }
+  FileDiscoveryServer(this.index, int transferServerPort, {this.sock})
+      : responsePrefix = utf8.encode(transferServerPort.toString());
 
   Future<void> bind() async {
     sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, UDP_PORT);
   }
 
-  void handleRequest(Datagram data) {
-    var key = utf8.decode(data.data);
+  Future<void> handleRequest(Datagram data) async {
+    var key = utf8.decode(data.data),
+        file = index.getFile(key),
+        exists = await file.exists();
+
     print(
-      "${data.address.address}:${data.port} requested file: $key -> ${index.fileMap[key]}",
+      "${data.address.address}:${data.port} requested file: $key, exists: $exists",
     );
-    if (!index.fileMap.containsKey(key)) {
-      return;
-    }
+
+    if (!exists) return;
     sock.send(
       responsePrefix + utf8.encode("\n\n" + key),
       data.address,
@@ -90,9 +61,7 @@ class FileDiscoveryServer {
     );
     return sock.listen((event) {
       var data = sock.receive();
-      if (data == null) {
-        return;
-      }
+      if (data == null) return;
       handleRequest(data);
     });
   }
@@ -114,22 +83,15 @@ class FileTransferServer {
     );
     return server.listen((request) {
       String key = pathlib.relative(request.uri.path, from: "/");
-      print(
-        "request to download file: $key -> ${index.fileMap[key]}",
-      );
+      print("request to download: $key");
       index.serveFile(key, request);
     });
   }
 }
 
 class NetworkFile {
-  static Future<void> runserver(
-    Directory root, {
-    bool useMD5Key: false,
-    bool recursive: false,
-  }) async {
-    var index = FileIndex(root, useMD5Key: useMD5Key, recursive: recursive);
-    await index.build();
+  static Future<void> runServer(Directory root) async {
+    var index = FileIndex(root);
 
     var fServer = FileTransferServer(index);
     await fServer.bind();
@@ -138,44 +100,40 @@ class NetworkFile {
     var dServer = FileDiscoveryServer(index, fServer.server.port);
     await dServer.bind();
     dServer.serveForever();
-
-    return [FileDiscoveryServer, FileTransferServer];
   }
 
-  static Future<String> findFile(
-    String key, {
+  static Future<String> findFile({
+    String path,
     Duration timeout: const Duration(seconds: 30),
   }) async {
     var sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     sock.broadcastEnabled = true;
 
-    sock.send(utf8.encode(key), InternetAddress(BCAST_ADDR), UDP_PORT);
+    sock.send(utf8.encode(path), InternetAddress(BCAST_ADDR), UDP_PORT);
 
     var completer = Completer();
     StreamSubscription sub;
 
-    sub = sock.timeout(timeout).listen(
-      (event) {
-        var data = sock.receive();
-        if (data == null) {
-          return;
-        }
-        var response = utf8.decode(data.data).split("\n\n");
-        if (response[1] != key) {
-          return;
-        }
-        sub.cancel();
-        completer.complete(
-          "http://${data.address.address}:${response[0]}/${response[1]}",
-        );
-      },
-      onError: (error, stackTrace) {
-        print(error);
-        print(stackTrace);
-        sub.cancel();
-        completer.completeError(error, stackTrace);
-      },
-    );
+    sub = sock.timeout(timeout).listen((event) {
+      var data = sock.receive();
+      if (data == null) {
+        return;
+      }
+      var response = utf8.decode(data.data).split("\n\n");
+      if (response[1] != path) {
+        return;
+      }
+      sub.cancel();
+      completer.complete(
+        "http://${data.address.address}:${response[0]}/${response[1]}",
+      );
+    }, onError: (error, stackTrace) {
+      print(error);
+      print(stackTrace);
+      sub.cancel();
+      completer.completeError(error, stackTrace);
+    });
+
     return await completer.future;
   }
 }
