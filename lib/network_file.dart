@@ -1,17 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:http_server/http_server.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as pathlib;
 
-const BCAST_ADDR = "255.255.255.255",
-    UDP_PORT = 10003,
-    _separator = "\n\n",
-    _NAME = "network_file";
-
-final _l = Logger(_NAME);
+const UDP_PORT = 10003, _NAME = "network_file";
+final _bcastAddr = InternetAddress("255.255.255.255"), _l = Logger(_NAME);
 
 class FileIndex {
   final Directory root;
@@ -30,11 +27,22 @@ class FileIndex {
   }
 }
 
+Uint8List _dumpInt(int value) {
+  return Uint64List.fromList([value]).buffer.asUint8List();
+}
+
+List _loadInt(List value) {
+  return [
+    Uint8List.fromList(value.sublist(0, 8)).buffer.asUint64List()[0],
+    value.sublist(8),
+  ];
+}
+
 typedef bool ShouldSAcceptDiscovery(FileSystemEntity file, String extra);
 
 class FileDiscoveryServer {
   final FileIndex index;
-  final List<int> responsePrefix;
+  final int transferServerPort, uid;
   final ShouldSAcceptDiscovery shouldAcceptDiscovery;
 
   RawDatagramSocket sock;
@@ -42,29 +50,31 @@ class FileDiscoveryServer {
 
   FileDiscoveryServer(
     this.index,
-    int transferServerPort, {
+    this.transferServerPort,
+    this.uid, {
     this.shouldAcceptDiscovery,
-  }) : responsePrefix = utf8.encode(transferServerPort.toString());
+  });
 
   Future<void> bind() async {
     sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, UDP_PORT);
   }
 
   Future<void> handleRequest(Datagram req) async {
-    var params = jsonDecode(utf8.decode(req.data)),
-        key = params[0],
+    final parts = _loadInt(req.data);
+    if (parts[0] == uid) return;
+    
+    final params = jsonDecode(utf8.decode(parts[1])),
+        path = params[0],
         extra = params[1],
-        file = index.getFile(key),
+        file = index.getFile(path),
         exists = await file.exists();
 
-    _l.fine("receieved discovery request: $key, $extra (exists: $exists)");
+    _l.fine(
+      "discovery request: $path, $extra (exists: $exists) (${req.address})",
+    );
 
     if (!exists || !(shouldAcceptDiscovery?.call(file, extra) ?? true)) return;
-    sock.send(
-      responsePrefix + utf8.encode(_separator + key),
-      req.address,
-      req.port,
-    );
+    sock.send([transferServerPort], req.address, req.port);
   }
 
   void serveForever() {
@@ -72,9 +82,9 @@ class FileDiscoveryServer {
       "FileDiscoveryServer listenng on: udp://${sock.address.address}:${sock.port}",
     );
     listener = sock.listen((event) {
-      var data = sock.receive();
-      if (data == null) return;
-      handleRequest(data);
+      final req = sock.receive();
+      if (req == null) return;
+      handleRequest(req);
     });
   }
 
@@ -105,7 +115,9 @@ class FileTransferServer {
     );
     listener = server.listen((request) {
       String key = pathlib.relative(request.uri.path, from: "/");
-      _l.fine("receieved download request: $key");
+      _l.fine(
+        "download request: $key (${request.connectionInfo.remoteAddress})",
+      );
       index.serveFile(key, request);
     });
   }
@@ -119,77 +131,70 @@ class FileTransferServer {
   }
 }
 
-class Servers {
-  final FileDiscoveryServer discoveryServer;
-  final FileTransferServer transferServer;
-
-  Servers(this.discoveryServer, this.transferServer);
-
-  Future<void> close() async {
-    await discoveryServer.close();
-    await transferServer.close();
-  }
-}
-
 class NetworkFile {
-  static Future<Servers> runServers(
+  FileDiscoveryServer discoveryServer;
+  FileTransferServer transferServer;
+
+  Future<void> run(
     Directory root, {
     ShouldSAcceptDiscovery shouldAcceptDiscovery,
   }) async {
     var index = FileIndex(root);
 
-    var fServer = FileTransferServer(index);
-    await fServer.bind();
-    fServer.serveForever();
+    transferServer = FileTransferServer(index);
+    await transferServer.bind();
+    transferServer.serveForever();
 
-    var dServer = FileDiscoveryServer(
+    discoveryServer = FileDiscoveryServer(
       index,
-      fServer.server.port,
+      transferServer.server.port,
+      hashCode,
       shouldAcceptDiscovery: shouldAcceptDiscovery,
     );
-    await dServer.bind();
-    dServer.serveForever();
-
-    return Servers(dServer, fServer);
+    await discoveryServer.bind();
+    discoveryServer.serveForever();
   }
 
-  static Future<String> findFile({
-    String path,
+  Future<void> stop() async {
+    await discoveryServer?.close();
+    discoveryServer = null;
+    await transferServer?.close();
+    transferServer = null;
+  }
+
+  Future<String> findFile(
+    String path, {
     Duration timeout: const Duration(seconds: 30),
     String extra,
   }) async {
-    var sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     sock.broadcastEnabled = true;
 
-    sock.send(
-      utf8.encode(jsonEncode([path, extra])),
-      InternetAddress(BCAST_ADDR),
-      UDP_PORT,
-    );
+    final payload = _dumpInt(hashCode) + utf8.encode(jsonEncode([path, extra]));
+    sock.send(payload, _bcastAddr, UDP_PORT);
 
-    var completer = Completer();
+    final completer = Completer();
     StreamSubscription sub;
 
     sub = sock.timeout(timeout).listen((event) {
-      var data = sock.receive();
-      if (data == null) {
-        return;
-      }
-      var response = utf8.decode(data.data).split(_separator);
-      if (response[1] != path) {
-        return;
-      }
+      final data = sock.receive(), response = data?.data;
+      if (response == null || response.length != 1) return;
       sub.cancel();
-      completer.complete(
-        "http://${data.address.address}:${response[0]}/${response[1]}",
-      );
+      completer.complete("http://${data.address.address}:${response[0]}/$path");
     }, onError: (error, stackTrace) {
-      print(error);
-      print(stackTrace);
       sub.cancel();
       completer.completeError(error, stackTrace);
     });
 
     return await completer.future;
+  }
+
+  NetworkFile._internal();
+
+  static NetworkFile _instance;
+
+  factory NetworkFile.getInstance() {
+    if (_instance == null) _instance = NetworkFile._internal();
+    return _instance;
   }
 }

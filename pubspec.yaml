@@ -1,6 +1,7 @@
 name: network_file
 description: A dead simple Dart library, to find and share files across devices on a network.
-version: 0.0.2
+version: 0.0.3
+
 author:
 homepage:
 
