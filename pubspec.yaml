@@ -1,9 +1,8 @@
 name: network_file
 description: A dead simple Dart library, to find and share files across devices on a network.
 version: 0.0.3
-
-author:
-homepage:
+author: Dev Aggarwal <devpxy@gmail.com>
+homepage: https://github.com/pycampers/flutter_cognito_plugin
 
 environment:
   sdk: ">=2.1.0 <3.0.0"
