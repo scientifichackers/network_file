@@ -62,7 +62,7 @@ class FileDiscoveryServer {
   Future<void> handleRequest(Datagram req) async {
     final parts = _loadInt(req.data);
     if (parts[0] == uid) return;
-    
+
     final params = jsonDecode(utf8.decode(parts[1])),
         path = params[0],
         extra = params[1],
@@ -74,7 +74,7 @@ class FileDiscoveryServer {
     );
 
     if (!exists || !(shouldAcceptDiscovery?.call(file, extra) ?? true)) return;
-    sock.send([transferServerPort], req.address, req.port);
+    sock.send(_dumpInt(transferServerPort), req.address, req.port);
   }
 
   void serveForever() {
@@ -116,7 +116,7 @@ class FileTransferServer {
     listener = server.listen((request) {
       String key = pathlib.relative(request.uri.path, from: "/");
       _l.fine(
-        "download request: $key (${request.connectionInfo.remoteAddress})",
+        "transfer request: $key (${request.connectionInfo.remoteAddress})",
       );
       index.serveFile(key, request);
     });
@@ -178,9 +178,14 @@ class NetworkFile {
 
     sub = sock.timeout(timeout).listen((event) {
       final data = sock.receive(), response = data?.data;
-      if (response == null || response.length != 1) return;
+      if (response == null) return;
+
+      final url =
+          "http://${data.address.address}:${_loadInt(response)[0]}/$path";
+      _l.info("found file: $url");
+
       sub.cancel();
-      completer.complete("http://${data.address.address}:${response[0]}/$path");
+      completer.complete(url);
     }, onError: (error, stackTrace) {
       sub.cancel();
       completer.completeError(error, stackTrace);
