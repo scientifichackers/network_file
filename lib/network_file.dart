@@ -135,7 +135,7 @@ class NetworkFile {
   FileDiscoveryServer discoveryServer;
   FileTransferServer transferServer;
 
-  Future<void> run(
+  Future<void> start(
     Directory root, {
     ShouldSAcceptDiscovery shouldAcceptDiscovery,
   }) async {
