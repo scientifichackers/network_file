@@ -162,7 +162,7 @@ class NetworkFile {
     transferServer = null;
   }
 
-  Future<String> findFile(
+  Future<Uri> findFile(
     String path, {
     Duration timeout: const Duration(seconds: 30),
     String extra,
@@ -173,19 +173,23 @@ class NetworkFile {
     final payload = _dumpInt(hashCode) + utf8.encode(jsonEncode([path, extra]));
     sock.send(payload, _bcastAddr, UDP_PORT);
 
-    final completer = Completer();
+    final completer = Completer<Uri>();
     StreamSubscription sub;
 
     sub = sock.timeout(timeout).listen((event) {
       final data = sock.receive(), response = data?.data;
       if (response == null) return;
 
-      final url =
-          "http://${data.address.address}:${_loadInt(response)[0]}/$path";
-      _l.info("found file: $url");
+      final uri = Uri(
+        scheme: "http",
+        host: data.address.address,
+        port: _loadInt(response)[0],
+        path: path,
+      );
+      _l.info("found file at url: $uri");
 
       sub.cancel();
-      completer.complete(url);
+      completer.complete(uri);
     }, onError: (error, stackTrace) {
       sub.cancel();
       completer.completeError(error, stackTrace);
