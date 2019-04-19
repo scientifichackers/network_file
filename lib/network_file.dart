@@ -70,7 +70,7 @@ class FileDiscoveryServer {
         exists = await file.exists();
 
     _l.fine(
-      "discovery request: $path, $extra (exists: $exists) (${req.address})",
+      "discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
     );
 
     if (!exists || !(shouldAcceptDiscovery?.call(file, extra) ?? true)) return;
@@ -116,7 +116,7 @@ class FileTransferServer {
     listener = server.listen((request) {
       String key = pathlib.relative(request.uri.path, from: "/");
       _l.fine(
-        "transfer request: $key (${request.connectionInfo.remoteAddress})",
+        "transfer request { key: $key ${request.connectionInfo.remoteAddress} }",
       );
       index.serveFile(key, request);
     });
