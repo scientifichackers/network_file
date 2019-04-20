@@ -60,7 +60,15 @@ class FileDiscoveryServer {
   }
 
   Future<void> handleRequest(Datagram req) async {
-    final parts = _loadInt(req.data);
+    final data = req.data;
+
+    if (data.isEmpty || data[0] == 0) {
+      _l.fine("peer discovery request { address: ${req.address} }");
+      sock.send([0], req.address, req.port);
+      return;
+    }
+
+    final parts = _loadInt(data);
     if (parts[0] == uid) return;
 
     final params = jsonDecode(utf8.decode(parts[1])),
@@ -70,7 +78,7 @@ class FileDiscoveryServer {
         exists = await file.exists();
 
     _l.fine(
-      "discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
+      "file discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
     );
 
     if (!exists || !(shouldAcceptDiscovery?.call(file, extra) ?? true)) return;
@@ -84,7 +92,11 @@ class FileDiscoveryServer {
     listener = sock.listen((event) {
       final req = sock.receive();
       if (req == null) return;
-      handleRequest(req);
+      try {
+        handleRequest(req);
+      } catch (e, trace) {
+        _l.fine("error in discovery server", e, trace);
+      }
     });
   }
 
@@ -160,6 +172,34 @@ class NetworkFile {
     discoveryServer = null;
     await transferServer?.close();
     transferServer = null;
+  }
+
+  Future<String> findPeer({
+    Duration timeout: const Duration(seconds: 30),
+  }) async {
+    final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    sock.broadcastEnabled = true;
+
+    sock.send([0], _bcastAddr, UDP_PORT);
+
+    final completer = Completer<String>();
+    StreamSubscription sub;
+
+    sub = sock.timeout(timeout).listen((event) {
+      final data = sock.receive(), response = data?.data;
+      if (response == null) return;
+
+      final addr = data.address.address;
+      _l.info("found peer at: $addr");
+
+      sub.cancel();
+      completer.complete(addr);
+    }, onError: (error, stackTrace) {
+      sub.cancel();
+      completer.completeError(error, stackTrace);
+    });
+
+    return await completer.future;
   }
 
   Future<Uri> findFile(
