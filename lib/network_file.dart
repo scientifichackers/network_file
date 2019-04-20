@@ -7,7 +7,7 @@ import 'package:http_server/http_server.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as pathlib;
 
-const UDP_PORT = 10003, _NAME = "network_file";
+const DEFAULT_UDP_PORT = 10003, _NAME = "network_file";
 final _bcastAddr = InternetAddress("255.255.255.255"), _l = Logger(_NAME);
 
 class FileIndex {
@@ -42,7 +42,7 @@ typedef bool ShouldSAcceptDiscovery(FileSystemEntity file, String extra);
 
 class FileDiscoveryServer {
   final FileIndex index;
-  final int transferServerPort, uid;
+  final int udpPort, transferServerPort, uid;
   final ShouldSAcceptDiscovery shouldAcceptDiscovery;
 
   RawDatagramSocket sock;
@@ -50,13 +50,14 @@ class FileDiscoveryServer {
 
   FileDiscoveryServer(
     this.index,
+    this.udpPort,
     this.transferServerPort,
     this.uid, {
     this.shouldAcceptDiscovery,
   });
 
   Future<void> bind() async {
-    sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, UDP_PORT);
+    sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, udpPort);
   }
 
   Future<void> handleRequest(Datagram req) async {
@@ -150,6 +151,7 @@ class NetworkFile {
   Future<void> start(
     Directory root, {
     ShouldSAcceptDiscovery shouldAcceptDiscovery,
+    int udpPort: DEFAULT_UDP_PORT,
   }) async {
     var index = FileIndex(root);
 
@@ -159,6 +161,7 @@ class NetworkFile {
 
     discoveryServer = FileDiscoveryServer(
       index,
+      udpPort,
       transferServer.server.port,
       hashCode,
       shouldAcceptDiscovery: shouldAcceptDiscovery,
@@ -180,7 +183,7 @@ class NetworkFile {
     final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     sock.broadcastEnabled = true;
 
-    sock.send([0], _bcastAddr, UDP_PORT);
+    sock.send([0], _bcastAddr, discoveryServer.udpPort);
 
     final completer = Completer<String>();
     StreamSubscription sub;
@@ -211,7 +214,7 @@ class NetworkFile {
     sock.broadcastEnabled = true;
 
     final payload = _dumpInt(hashCode) + utf8.encode(jsonEncode([path, extra]));
-    sock.send(payload, _bcastAddr, UDP_PORT);
+    sock.send(payload, _bcastAddr, discoveryServer.udpPort);
 
     final completer = Completer<Uri>();
     StreamSubscription sub;
