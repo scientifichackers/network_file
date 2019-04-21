@@ -61,34 +61,35 @@ class FileDiscoveryServer {
   }
 
   Future<void> handleRequest(Datagram req) async {
-    final data = req.data;
-
-    if (data.isEmpty || data[0] == 0) {
-      _l.fine("peer discovery request { address: ${req.address} }");
-      sock.send([0], req.address, req.port);
-      return;
-    }
-
-    final parts = _loadInt(data);
+    final parts = _loadInt(req.data);
     if (parts[0] == uid) return;
 
     final params = jsonDecode(utf8.decode(parts[1])),
         path = params[0],
-        extra = params[1],
-        file = index.getFile(path),
-        exists = await file.exists();
+        extra = params[1];
 
-    _l.fine(
-      "file discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
-    );
+    if (path == null) {
+      _l.fine(
+        "peer discovery request { address: ${req.address}, extra: $extra }",
+      );
+      if (shouldAcceptDiscovery != null && !shouldAcceptDiscovery(null, extra))
+        return;
+    } else {
+      final file = index.getFile(path), exists = await file.exists();
+      _l.fine(
+        "file discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
+      );
+      if (!exists ||
+          (shouldAcceptDiscovery != null &&
+              !shouldAcceptDiscovery(file, extra))) return;
+    }
 
-    if (!exists || !(shouldAcceptDiscovery?.call(file, extra) ?? true)) return;
     sock.send(_dumpInt(transferServerPort), req.address, req.port);
   }
 
   void serveForever() {
     _l.info(
-      "FileDiscoveryServer listenng on: udp://${sock.address.address}:${sock.port}",
+      "FileDiscoveryServer started @ udp://${sock.address.address}:${sock.port}",
     );
     listener = sock.listen((event) {
       final req = sock.receive();
@@ -124,7 +125,7 @@ class FileTransferServer {
 
   void serveForever() {
     _l.info(
-      "FileTransferServer listenng on: tcp://${server.address.address}:${server.port}",
+      "FileTransferServer started @ http://${server.address.address}:${server.port}",
     );
     listener = server.listen((request) {
       String key = pathlib.relative(request.uri.path, from: "/");
@@ -147,11 +148,11 @@ class FileTransferServer {
 class NetworkFile {
   FileDiscoveryServer discoveryServer;
   FileTransferServer transferServer;
+  final int udpPort;
 
   Future<void> start(
     Directory root, {
     ShouldSAcceptDiscovery shouldAcceptDiscovery,
-    int udpPort: DEFAULT_UDP_PORT,
   }) async {
     var index = FileIndex(root);
 
@@ -177,44 +178,17 @@ class NetworkFile {
     transferServer = null;
   }
 
-  Future<String> findPeer({
-    Duration timeout: const Duration(seconds: 30),
-  }) async {
-    final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-    sock.broadcastEnabled = true;
-
-    sock.send([0], _bcastAddr, discoveryServer.udpPort);
-
-    final completer = Completer<String>();
-    StreamSubscription sub;
-
-    sub = sock.timeout(timeout).listen((event) {
-      final data = sock.receive(), response = data?.data;
-      if (response == null) return;
-
-      final addr = data.address.address;
-      _l.info("found peer at: $addr");
-
-      sub.cancel();
-      completer.complete(addr);
-    }, onError: (error, stackTrace) {
-      sub.cancel();
-      completer.completeError(error, stackTrace);
-    });
-
-    return await completer.future;
-  }
-
-  Future<Uri> findFile(
-    String path, {
+  Future<Uri> find({
+    String filePath,
     Duration timeout: const Duration(seconds: 30),
     String extra,
   }) async {
     final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     sock.broadcastEnabled = true;
 
-    final payload = _dumpInt(hashCode) + utf8.encode(jsonEncode([path, extra]));
-    sock.send(payload, _bcastAddr, discoveryServer.udpPort);
+    final payload =
+        _dumpInt(hashCode) + utf8.encode(jsonEncode([filePath, extra]));
+    sock.send(payload, _bcastAddr, udpPort);
 
     final completer = Completer<Uri>();
     StreamSubscription sub;
@@ -227,7 +201,7 @@ class NetworkFile {
         scheme: "http",
         host: data.address.address,
         port: _loadInt(response)[0],
-        path: path,
+        path: filePath,
       );
       _l.info("found file at url: $uri");
 
@@ -241,12 +215,12 @@ class NetworkFile {
     return await completer.future;
   }
 
-  NetworkFile._internal();
+  NetworkFile._internal(this.udpPort);
 
   static NetworkFile _instance;
 
-  factory NetworkFile.getInstance() {
-    if (_instance == null) _instance = NetworkFile._internal();
+  factory NetworkFile.getInstance({int udpPort: DEFAULT_UDP_PORT}) {
+    if (_instance == null) _instance = NetworkFile._internal(udpPort);
     return _instance;
   }
 }
