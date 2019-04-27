@@ -64,13 +64,13 @@ class FileDiscoveryServer {
     final parts = _loadInt(req.data);
     if (parts[0] == uid) return;
 
-    final params = jsonDecode(utf8.decode(parts[1])),
-        path = params[0],
-        extra = params[1];
+    final params = jsonDecode(utf8.decode(parts[1]));
+    final path = params[0];
+    final extra = params[1];
 
     if (path == null) {
       _l.fine(
-        "peer discovery request { address: ${req.address}, extra: $extra }",
+        "peer discovery request { address: ${req.address.address}, extra: $extra }",
       );
       if (shouldAcceptDiscovery != null && !shouldAcceptDiscovery(null, extra))
         return;
@@ -182,18 +182,25 @@ class NetworkFile {
     String filePath,
     Duration timeout: const Duration(seconds: 30),
     String extra,
+    Duration broadcastInterval: const Duration(milliseconds: 100),
   }) async {
+    final completer = Completer<Uri>();
+
     final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     sock.broadcastEnabled = true;
 
     final payload =
         _dumpInt(hashCode) + utf8.encode(jsonEncode([filePath, extra]));
-    sock.send(payload, _bcastAddr, udpPort);
+    final sendTimer = Timer.periodic(broadcastInterval, (timer) {
+      if (completer.isCompleted) {
+        timer.cancel();
+        return;
+      }
+      sock.send(payload, _bcastAddr, udpPort);
+    });
 
-    final completer = Completer<Uri>();
-    StreamSubscription sub;
-
-    sub = sock.timeout(timeout).listen((event) {
+    StreamSubscription recvSub;
+    recvSub = sock.timeout(timeout).listen((event) {
       final data = sock.receive(), response = data?.data;
       if (response == null) return;
 
@@ -203,16 +210,21 @@ class NetworkFile {
         port: _loadInt(response)[0],
         path: filePath,
       );
-      _l.info("found file at url: $uri");
+      _l.info("found ${filePath ?? 'peer'} @ $uri");
 
-      sub.cancel();
+      recvSub.cancel();
       completer.complete(uri);
     }, onError: (error, stackTrace) {
-      sub.cancel();
+      recvSub.cancel();
       completer.completeError(error, stackTrace);
     });
 
-    return await completer.future;
+    try {
+      return await completer.future;
+    } finally {
+      sendTimer.cancel();
+      recvSub.cancel();
+    }
   }
 
   NetworkFile._internal(this.udpPort);
