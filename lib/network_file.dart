@@ -7,8 +7,9 @@ import 'package:http_server/http_server.dart';
 import 'package:logging/logging.dart';
 import 'package:path/path.dart' as pathlib;
 
-const DEFAULT_UDP_PORT = 10003, _NAME = "network_file";
-final _bcastAddr = InternetAddress("255.255.255.255"), _l = Logger(_NAME);
+const defaultUdpPort = 10003;
+final _bcastAddr = InternetAddress("255.255.255.255");
+final _l = Logger("network_file");
 
 class FileIndex {
   final Directory root;
@@ -38,12 +39,16 @@ List _loadInt(List value) {
   ];
 }
 
-typedef bool ShouldSAcceptDiscovery(FileSystemEntity file, String extra);
+typedef bool DiscoveryCallback(
+  String host,
+  FileSystemEntity file,
+  String extra,
+);
 
 class FileDiscoveryServer {
   final FileIndex index;
   final int udpPort, transferServerPort, uid;
-  final ShouldSAcceptDiscovery shouldAcceptDiscovery;
+  final DiscoveryCallback onDiscovery;
 
   RawDatagramSocket sock;
   StreamSubscription<RawSocketEvent> listener;
@@ -53,7 +58,7 @@ class FileDiscoveryServer {
     this.udpPort,
     this.transferServerPort,
     this.uid, {
-    this.shouldAcceptDiscovery,
+    this.onDiscovery,
   });
 
   Future<void> bind() async {
@@ -68,20 +73,24 @@ class FileDiscoveryServer {
     final path = params[0];
     final extra = params[1];
 
+    File file;
     if (path == null) {
       _l.fine(
         "peer discovery request { address: ${req.address.address}, extra: $extra }",
       );
-      if (shouldAcceptDiscovery != null && !shouldAcceptDiscovery(null, extra))
-        return;
     } else {
-      final file = index.getFile(path), exists = await file.exists();
+      file = index.getFile(path);
+      final exists = await file.exists();
+
       _l.fine(
         "file discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
       );
-      if (!exists ||
-          (shouldAcceptDiscovery != null &&
-              !shouldAcceptDiscovery(file, extra))) return;
+
+      if (!exists) return;
+    }
+
+    if (onDiscovery != null && !onDiscovery(req.address.host, file, extra)) {
+      return;
     }
 
     sock.send(_dumpInt(transferServerPort), req.address, req.port);
@@ -150,10 +159,7 @@ class NetworkFile {
   FileTransferServer transferServer;
   final int udpPort;
 
-  Future<void> start(
-    Directory root, {
-    ShouldSAcceptDiscovery shouldAcceptDiscovery,
-  }) async {
+  Future<void> start(Directory root, {DiscoveryCallback onDiscovery}) async {
     var index = FileIndex(root);
 
     transferServer = FileTransferServer(index);
@@ -165,7 +171,7 @@ class NetworkFile {
       udpPort,
       transferServer.server.port,
       hashCode,
-      shouldAcceptDiscovery: shouldAcceptDiscovery,
+      onDiscovery: onDiscovery,
     );
     await discoveryServer.bind();
     discoveryServer.serveForever();
@@ -231,7 +237,7 @@ class NetworkFile {
 
   static NetworkFile _instance;
 
-  factory NetworkFile.getInstance({int udpPort: DEFAULT_UDP_PORT}) {
+  factory NetworkFile.getInstance({int udpPort: defaultUdpPort}) {
     if (_instance == null) _instance = NetworkFile._internal(udpPort);
     return _instance;
   }
