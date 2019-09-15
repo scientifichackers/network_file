@@ -1,193 +1,181 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:http_server/http_server.dart';
 import 'package:logging/logging.dart';
+import 'package:network_file/util.dart';
 import 'package:path/path.dart' as pathlib;
 
-const defaultUdpPort = 10003;
-final _bcastAddr = InternetAddress("255.255.255.255");
-final _l = Logger("network_file");
+final _log = Logger("network_file");
 
-class FileIndex {
-  final Directory root;
-  final VirtualDirectory vDir;
-
-  FileIndex(Directory root)
-      : this.root = root.absolute,
-        vDir = VirtualDirectory(root.path);
-
-  File getFile(String key) {
-    return File(root.path + "/" + key);
-  }
-
-  void serveFile(String key, HttpRequest request) {
-    vDir.serveFile(getFile(key), request);
-  }
-}
-
-Uint8List _dumpInt(int value) {
-  return Uint64List.fromList([value]).buffer.asUint8List();
-}
-
-List _loadInt(List value) {
-  return [
-    Uint8List.fromList(value.sublist(0, 8)).buffer.asUint64List()[0],
-    value.sublist(8),
-  ];
-}
-
-typedef bool DiscoveryCallback(
-  String host,
-  FileSystemEntity file,
-  String extra,
-);
-
-class FileDiscoveryServer {
-  final FileIndex index;
-  final int udpPort, transferServerPort, uid;
-  final DiscoveryCallback onDiscovery;
-
-  RawDatagramSocket sock;
-  StreamSubscription<RawSocketEvent> listener;
-
-  FileDiscoveryServer(
-    this.index,
-    this.udpPort,
-    this.transferServerPort,
-    this.uid, {
-    this.onDiscovery,
-  });
-
-  Future<void> bind() async {
-    sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, udpPort);
-  }
-
-  Future<void> handleRequest(Datagram req) async {
-    final parts = _loadInt(req.data);
-    if (parts[0] == uid) return;
-
-    final params = jsonDecode(utf8.decode(parts[1]));
-    final path = params[0];
-    final extra = params[1];
-
-    File file;
-    if (path == null) {
-      _l.fine(
-        "peer discovery request { address: ${req.address.address}, extra: $extra }",
+class NetworkFileCallbacks {
+  Future<bool> acceptClientDiscovery(
+    InternetAddress address,
+    String rootDir,
+    String path,
+    requestData,
+  ) async {
+    if (rootDir == null || path == null) {
+      _log.fine(
+        "peer discovery request { from: $address, requestData: $requestData }",
       );
+      return true;
     } else {
-      file = index.getFile(path);
-      final exists = await file.exists();
-
-      _l.fine(
-        "file discovery request { path: $path, extra: $extra file: $file exists: $exists, address: ${req.address} }",
+      var file = File("$rootDir/$path");
+      var exists = await file.exists();
+      _log.fine(
+        "file discovery request { from: $address path: $path, requestData: $requestData file: $file exists: $exists }",
       );
-
-      if (!exists) return;
+      return exists;
     }
-
-    if (onDiscovery != null && !onDiscovery(req.address.host, file, extra)) {
-      return;
-    }
-
-    sock.send(_dumpInt(transferServerPort), req.address, req.port);
   }
 
-  void serveForever() {
-    _l.info(
-      "FileDiscoveryServer started @ udp://${sock.address.address}:${sock.port}",
-    );
-    listener = sock.listen((event) {
-      final req = sock.receive();
-      if (req == null) return;
-      try {
-        handleRequest(req);
-      } catch (e, trace) {
-        _l.fine("error in discovery server", e, trace);
-      }
-    });
+  Future<bool> acceptServerDiscovery(
+    Uri uri,
+    String path,
+    responseData,
+  ) async {
+    return true;
   }
 
-  Future<void> close() async {
-    sock?.close();
-    sock = null;
-    await listener?.cancel();
-    listener = null;
-    _l.info("FileDiscoveryServer closed!");
-  }
-}
-
-class FileTransferServer {
-  final FileIndex index;
-
-  HttpServer server;
-  StreamSubscription<HttpRequest> listener;
-
-  FileTransferServer(this.index);
-
-  Future<void> bind() async {
-    server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
-  }
-
-  void serveForever() {
-    _l.info(
-      "FileTransferServer started @ http://${server.address.address}:${server.port}",
-    );
-    listener = server.listen((request) {
-      String key = pathlib.relative(request.uri.path, from: "/");
-      _l.fine(
-        "transfer request { key: $key ${request.connectionInfo.remoteAddress} }",
-      );
-      index.serveFile(key, request);
-    });
-  }
-
-  Future<void> close() async {
-    await server?.close();
-    server = null;
-    await listener?.cancel();
-    listener = null;
-    _l.info("FileTransferServer closed!");
+  Future<void> serveFile(String rootDir, String path, HttpRequest req) async {
+    VirtualDirectory(rootDir).serveFile(File("$rootDir/$path"), req);
   }
 }
 
 class NetworkFile {
-  FileDiscoveryServer discoveryServer;
-  FileTransferServer transferServer;
+  static var bcastAddr = InternetAddress("255.255.255.255");
+
+  //
+  // constructor
+  //
+
   final int udpPort;
+  String rootDir;
+  var responseData;
+  NetworkFileCallbacks callbacks;
+  static final Map<int, NetworkFile> _instances = {};
 
-  Future<void> start(Directory root, {DiscoveryCallback onDiscovery}) async {
-    var index = FileIndex(root);
+  NetworkFile._internal(this.udpPort);
 
-    transferServer = FileTransferServer(index);
-    await transferServer.bind();
-    transferServer.serveForever();
-
-    discoveryServer = FileDiscoveryServer(
-      index,
-      udpPort,
-      transferServer.server.port,
-      hashCode,
-      onDiscovery: onDiscovery,
-    );
-    await discoveryServer.bind();
-    discoveryServer.serveForever();
+  factory NetworkFile.getInstance({
+    int udpPort: 10003,
+    String rootDir,
+    dynamic responseData,
+    NetworkFileCallbacks callbacks,
+  }) {
+    _instances.putIfAbsent(udpPort, () {
+      return NetworkFile._internal(udpPort);
+    });
+    var instance = _instances[udpPort];
+    instance.rootDir = rootDir;
+    instance.responseData = responseData;
+    instance.callbacks = callbacks ?? NetworkFileCallbacks();
+    return instance;
   }
 
-  Future<void> stop() async {
-    await discoveryServer?.close();
+  //
+  // server side
+  //
+
+  Future<void> startServer() async {
+    await startDiscoveryServer();
+    await startFileServer();
+  }
+
+  Future<void> stopServer() async {
+    discoveryServer?.close();
     discoveryServer = null;
-    await transferServer?.close();
-    transferServer = null;
+    await discoveryServerSub?.cancel();
+    discoveryServerSub = null;
+    _log.info("discovery server closed");
+
+    fileServer?.close();
+    fileServer = null;
+    await fileServerSub?.cancel();
+    fileServerSub = null;
+    _log.info("file server closed");
   }
+
+  //
+  // discovery server
+  //
+
+  RawDatagramSocket discoveryServer;
+  StreamSubscription<RawSocketEvent> discoveryServerSub;
+
+  Future<void> startDiscoveryServer() async {
+    discoveryServer =
+        await RawDatagramSocket.bind(InternetAddress.anyIPv4, udpPort);
+    _log.info(
+      "discovery server started @ udp://${discoveryServer.address.address}:${discoveryServer.port}",
+    );
+
+    discoveryServerSub = discoveryServer.listen((_) {
+      final req = discoveryServer.receive();
+      if (req == null) return;
+      try {
+        onDiscoveryRequest(req);
+      } catch (e, trace) {
+        _log.fine("error in discovery server", e, trace);
+      }
+    });
+  }
+
+  Future<void> onDiscoveryRequest(Datagram req) async {
+    if (fileServer == null) return;
+
+    var payload = load(req.data);
+    if (payload.intPrefix == hashCode) return;
+
+    var path = payload.jsonData[0];
+    var requestData = payload.jsonData[1];
+
+    if (await callbacks.acceptClientDiscovery(
+      req.address,
+      rootDir,
+      path,
+      requestData,
+    )) {
+      discoveryServer.send(
+        dump(Payload(fileServer.port, responseData)),
+        req.address,
+        req.port,
+      );
+    }
+  }
+
+  //
+  // file server
+  //
+
+  HttpServer fileServer;
+  StreamSubscription<HttpRequest> fileServerSub;
+
+  Future<void> startFileServer() async {
+    fileServer = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+    _log.info(
+      "file server started @ http://${fileServer.address.address}:${fileServer.port}",
+    );
+    fileServerSub = fileServer.listen(onFileServerRequest);
+  }
+
+  void onFileServerRequest(HttpRequest req) async {
+    var path = pathlib.relative(req.uri.path, from: "/");
+    _log.fine(
+      "file request { from: ${req.connectionInfo.remoteAddress}, path: $path }",
+    );
+    await callbacks.serveFile(rootDir, path, req);
+  }
+
+  //
+  // client side
+  //
 
   Future<Uri> find({
-    String filePath,
+    String path,
     Duration timeout: const Duration(seconds: 30),
-    String extra,
+    dynamic requestData,
     Duration broadcastInterval: const Duration(milliseconds: 100),
   }) async {
     final completer = Completer<Uri>();
@@ -195,31 +183,39 @@ class NetworkFile {
     final sock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
     sock.broadcastEnabled = true;
 
-    final payload =
-        _dumpInt(hashCode) + utf8.encode(jsonEncode([filePath, extra]));
+    final payload = dump(Payload(hashCode, [path, requestData]));
     final sendTimer = Timer.periodic(broadcastInterval, (timer) {
       if (completer.isCompleted) {
         timer.cancel();
         return;
       }
-      sock.send(payload, _bcastAddr, udpPort);
+      sock.send(payload, bcastAddr, udpPort);
     });
 
     StreamSubscription recvSub;
-    recvSub = sock.timeout(timeout).listen((event) {
-      final data = sock.receive(), response = data?.data;
-      if (response == null) return;
+    recvSub = sock.timeout(timeout).listen((event) async {
+      var datagram = sock.receive();
+      if (datagram == null) return;
 
-      final uri = Uri(
+      var payload = load(datagram.data);
+      var uri = Uri(
         scheme: "http",
-        host: data.address.address,
-        port: _loadInt(response)[0],
-        path: filePath,
+        host: datagram.address.address,
+        port: payload.intPrefix,
+        path: path,
       );
-      _l.info("found ${filePath ?? 'peer'} @ $uri");
+      _log.info("found ${'path "$path"' ?? 'peer'} @ $uri");
 
-      recvSub.cancel();
-      completer.complete(uri);
+      if (await callbacks.acceptServerDiscovery(
+        uri,
+        path,
+        payload.jsonData,
+      )) {
+        recvSub.cancel();
+        completer.complete(uri);
+      } else {
+        _log.info("rejected $uri");
+      }
     }, onError: (error, stackTrace) {
       recvSub.cancel();
       completer.completeError(error, stackTrace);
@@ -231,14 +227,5 @@ class NetworkFile {
       sendTimer.cancel();
       recvSub.cancel();
     }
-  }
-
-  NetworkFile._internal(this.udpPort);
-
-  static NetworkFile _instance;
-
-  factory NetworkFile.getInstance({int udpPort: defaultUdpPort}) {
-    if (_instance == null) _instance = NetworkFile._internal(udpPort);
-    return _instance;
   }
 }
