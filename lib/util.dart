@@ -1,6 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
+
+final log = Logger("network_file");
 const uint8Size = Uint8List.bytesPerElement * 8;
 
 class Payload {
